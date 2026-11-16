@@ -51,24 +51,46 @@ The resulting binary will be located at `target/release/rust-mlx-cli`.
 
 ## Usage
 
-### Default Model (`LiquidAI/LFM3-1.7B`)
+### Basic Usage
 
-Run without arguments to use the default model:
+Run with default settings (`LiquidAI/LFM3-1.7B` at Q4K quantization):
 
 ```sh
 ./target/release/rust-mlx-cli
 ```
 
-### Custom Model
-
-You can specify any Hugging Face model ID as the first argument:
+### Command-Line Options
 
 ```sh
-./target/release/rust-mlx-cli "LiquidAI/LFM3-1.7B"
+./target/release/rust-mlx-cli [OPTIONS]
+
+Options:
+  -m, --model <MODEL>
+          Hugging Face model ID or local directory [default: LiquidAI/LFM3-1.7B]
+  -q, --quant <QUANT>
+          In-situ quantization type (e.g. q4k, q8_0, q4_0, q2k) [default: q4k]
+  -t, --temperature <TEMPERATURE>
+          Sampler temperature [default: 0.1]
+      --top-k <TOP_K>
+          Sampler top-k [default: 50]
+      --frequency-penalty <FREQUENCY_PENALTY>
+          Sampler frequency penalty [default: 0.1]
+      --cache-dir <CACHE_DIR>
+          Custom cache directory for UQFF quantized models
+      --system-prompt <SYSTEM_PROMPT>
+          Override the default system prompt
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
-### REPL Commands
+### REPL Shortcuts
 
+- **Persistent history**: Arrow Up / Down navigates previous commands across sessions.
+- **Line editing**: Standard Emacs / Vi navigation shortcuts (Ctrl+A, Ctrl+E, Ctrl+W, etc.).
+- **Graceful interruption**: `Ctrl+C` cancels active generation or tool turns without terminating the session.
+- `Ctrl+D`: Exit (EOF).
 - `/clear`: Reset conversation context and unload dynamically discovered tools.
 - `/quit` or `/exit`: Exit the assistant.
 

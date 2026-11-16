@@ -21,25 +21,12 @@ A comprehensive code review of `rust-mlx-cli` was performed on `main.rs`, `Cargo
 
 ## 2. CLI Ergonomics & Configuration (P1 / High)
 
-- [ ] **Adopt `clap` for Robust CLI Arguments**:
-  - *Current behavior*: Uses naive `std::env::args().nth(1)`. Running `--help` attempts to download `--help` from Hugging Face.
-  - *Fix*: Integrate `clap` (derive):
-    - `-m, --model <ID>`: Model identifier (default: `LiquidAI/LFM3-1.7B`).
-    - `-q, --quant <TYPE>`: Quantization format (`q4k`, `q8_0`, `q4_0`, etc.).
-    - `-t, --temperature <FLOAT>`: Generation temperature (default: `0.1`).
-    - `--top-k <INT>`: Sampler top-k.
-    - `--cache-dir <PATH>`: Custom directory for storing quantized models.
-    - `--system-prompt <TEXT>`: Custom system prompt override.
-    - `--help` and `--version`.
-- [ ] **Rich Terminal REPL (`rustyline` or `reedline`)**:
-  - *Current behavior*: Uses basic `std::io::stdin().read_line()` with no line editing, history, or cursor keys.
-  - *Fix*: Replace with `rustyline` to enable:
-    - Persistent command/prompt history (arrow up/down).
-    - Emacs/Vi cursor navigation, word jumping, and line editing.
-    - History file persistence in `~/.cache/rust-mlx-cli/history.txt`.
-- [ ] **Graceful Cancellation on Ctrl+C**:
-  - *Current behavior*: Ctrl+C during model generation kills the entire process.
-  - *Fix*: Intercept SIGINT (`tokio::signal::ctrl_c()`) so Ctrl+C cancels the active generation/tool turn and returns to the `> ` prompt.
+- [x] **Adopt `clap` for Robust CLI Arguments**:
+  - *Implemented*: Integrated `clap` (derive) with `--model`, `--quant` (parsed into valid `IsqType`), `--temperature`, `--top-k`, `--frequency-penalty`, `--cache-dir`, `--system-prompt`, `--help`, and `--version`.
+- [x] **Rich Terminal REPL (`rustyline` or `reedline`)**:
+  - *Implemented*: Integrated `rustyline` with persistent history in `~/.cache/rust-mlx-cli/history.txt`, line editing, arrow-key navigation, and EOF (`Ctrl+D`) / interrupt handling.
+- [x] **Graceful Cancellation on Ctrl+C**:
+  - *Implemented*: Added `tokio::select!` with `tokio::signal::ctrl_c()` across model inference and tool executions, cancelling the current turn without terminating the REPL.
 
 ---
 

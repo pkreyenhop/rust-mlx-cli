@@ -1,13 +1,52 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use clap::Parser;
 use mistralrs::{
-    Function, IsqType, RequestBuilder, TextMessageRole, TextMessages, TextModelBuilder, Tool,
-    ToolChoice, ToolType, UqffTextModelBuilder,
+    parse_isq_value, Function, IsqType, RequestBuilder, TextMessageRole, TextMessages,
+    TextModelBuilder, Tool, ToolChoice, ToolType, UqffTextModelBuilder,
 };
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "Local terminal assistant with Apple Silicon (Metal) acceleration and dynamic tool calling"
+)]
+struct Args {
+    /// Hugging Face model ID or local directory
+    #[arg(short, long, default_value = "LiquidAI/LFM3-1.7B")]
+    model: String,
+
+    /// In-situ quantization type (e.g. q4k, q8_0, q4_0, q2k)
+    #[arg(short, long, default_value = "q4k")]
+    quant: String,
+
+    /// Sampler temperature
+    #[arg(short, long, default_value_t = 0.1)]
+    temperature: f64,
+
+    /// Sampler top-k
+    #[arg(long, default_value_t = 50)]
+    top_k: usize,
+
+    /// Sampler frequency penalty
+    #[arg(long, default_value_t = 0.1)]
+    frequency_penalty: f32,
+
+    /// Custom cache directory for UQFF quantized models
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+
+    /// Override the default system prompt
+    #[arg(long)]
+    system_prompt: Option<String>,
+}
 
 struct ToolEntry {
     spec: Tool,
@@ -16,32 +55,37 @@ struct ToolEntry {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
     let t0 = Instant::now();
-    let model_id = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "LiquidAI/LFM3-1.7B".to_string());
 
-    // Store pre-quantized UQFF cache in ~/.cache/rust-mlx-cli/<model>-q4k/
-    let cache_dir = dirs_cache_path();
-    let safe_name = model_id.replace('/', "--");
-    let model_cache_dir = cache_dir.join(format!("{}-q4k", safe_name));
-    let uqff_target = model_cache_dir.join("q4k.uqff");
+    let quant_name = args.quant.to_lowercase();
+    let isq_type: IsqType = parse_isq_value(&quant_name, None)
+        .map_err(|e| anyhow::anyhow!("Invalid quantization format '{}': {}", quant_name, e))?;
 
-    let model = if is_valid_cache(&model_cache_dir) {
+    let cache_dir = args.cache_dir.unwrap_or_else(dirs_cache_path);
+    std::fs::create_dir_all(&cache_dir)?;
+
+    let safe_name = args.model.replace('/', "--");
+    let model_cache_dir = cache_dir.join(format!("{}-{}", safe_name, quant_name));
+    let uqff_shard_name = format!("{}-0.uqff", quant_name);
+    let uqff_target = model_cache_dir.join(format!("{}.uqff", quant_name));
+
+    let model = if is_valid_cache(&model_cache_dir, &quant_name) {
         // FAST PATH: Load pre-quantized UQFF directly from verified local cache directory
         eprintln!(
-            "Loading cached Q4K UQFF model from {}...",
+            "Loading cached {} UQFF model from {}...",
+            quant_name.to_uppercase(),
             model_cache_dir.display()
         );
         UqffTextModelBuilder::new(
             model_cache_dir.display().to_string(),
-            vec![PathBuf::from("q4k-0.uqff")],
+            vec![PathBuf::from(&uqff_shard_name)],
         )
         .into_inner()
         .build()
         .await?
     } else {
-        // FIRST RUN OR CORRUPTED CACHE: Clean up partial state and quantize to Q4K
+        // FIRST RUN OR CORRUPTED CACHE: Clean up partial state and quantize
         if model_cache_dir.exists() {
             eprintln!(
                 "Incomplete or invalid cache detected in {}. Cleaning up and re-quantizing...",
@@ -51,12 +95,13 @@ async fn main() -> Result<()> {
         }
         std::fs::create_dir_all(&model_cache_dir)?;
         eprintln!(
-            "First run: quantizing {} to Q4K and saving UQFF cache to {}...",
-            model_id,
+            "First run: quantizing {} to {} and saving UQFF cache to {}...",
+            args.model,
+            quant_name.to_uppercase(),
             model_cache_dir.display()
         );
-        TextModelBuilder::new(&model_id)
-            .with_isq(IsqType::Q4K)
+        TextModelBuilder::new(&args.model)
+            .with_isq(isq_type)
             .write_uqff(uqff_target)
             .build()
             .await?
@@ -71,29 +116,45 @@ async fn main() -> Result<()> {
         .map(|(name, _)| name.clone())
         .collect();
 
-    let system_prompt = "You are a local terminal assistant. You start with only `search_tools` loaded. \
+    let default_prompt = "You are a local terminal assistant. You start with only `search_tools` loaded. \
         Whenever a user request requires an external capability (files, shell, system stats), first call \
         `search_tools` with a short keyword query to discover and load the relevant tool schema, then invoke it.";
 
+    let system_prompt = args.system_prompt.as_deref().unwrap_or(default_prompt);
+
     let mut messages = TextMessages::new().add_message(TextMessageRole::System, system_prompt);
 
-    let stdin = io::stdin();
-    let mut input = String::new();
+    let mut rl = DefaultEditor::new().context("Failed to initialize terminal REPL editor")?;
+    let history_file = cache_dir.join("history.txt");
+    if history_file.exists() {
+        let _ = rl.load_history(&history_file);
+    }
 
     loop {
-        print!("> ");
-        io::stdout().flush()?;
-
-        input.clear();
-        if stdin.read_line(&mut input)? == 0 {
-            println!();
-            break;
-        }
+        let readline = rl.readline("> ");
+        let input = match readline {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                println!();
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error reading input: {}", err);
+                break;
+            }
+        };
 
         let trimmed = input.trim();
         if trimmed.is_empty() {
             continue;
         }
+
+        let _ = rl.add_history_entry(trimmed);
+
         if trimmed == "/quit" || trimmed == "/exit" {
             break;
         }
@@ -109,12 +170,13 @@ async fn main() -> Result<()> {
         // Maintain a RequestBuilder across tool turns so tool calls and results append cleanly
         let mut req_builder = RequestBuilder::from(messages.clone())
             .enable_thinking(true)
-            .set_sampler_temperature(0.1)
-            .set_sampler_topk(50)
-            .set_sampler_frequency_penalty(0.1);
+            .set_sampler_temperature(args.temperature)
+            .set_sampler_topk(args.top_k)
+            .set_sampler_frequency_penalty(args.frequency_penalty);
 
         const MAX_TOOL_TURNS: usize = 10;
         let mut tool_turn_count = 0;
+        let mut interrupted = false;
 
         loop {
             let active_tools: Vec<Tool> = active_tool_names
@@ -126,7 +188,22 @@ async fn main() -> Result<()> {
                 .set_tools(active_tools)
                 .set_tool_choice(ToolChoice::Auto);
 
-            let response = model.send_chat_request(req_builder.clone()).await?;
+            // Execute inference with graceful Ctrl+C cancellation
+            let response = tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\n\x1b[33m[Generation interrupted by user (Ctrl+C)]\x1b[0m\n");
+                    interrupted = true;
+                    break;
+                }
+                res = model.send_chat_request(req_builder.clone()) => match res {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        eprintln!("\x1b[31m[inference error: {}]\x1b[0m\n", e);
+                        break;
+                    }
+                }
+            };
+
             let choice = &response.choices[0];
 
             if let Some(tool_calls) = &choice.message.tool_calls {
@@ -154,23 +231,37 @@ async fn main() -> Result<()> {
                     );
                     messages = messages.add_message(TextMessageRole::Assistant, &assistant_text);
 
+                    let mut tool_loop_interrupted = false;
+
                     for call in tool_calls {
                         let fn_name = &call.function.name;
                         let args_str = &call.function.arguments;
                         eprintln!("\x1b[33m[tool_call] {}({})\x1b[0m", fn_name, args_str);
 
-                        let output = execute_tool(
-                            fn_name,
-                            args_str,
-                            &catalog,
-                            &mut active_tool_names,
-                        )
-                        .await;
+                        let output = tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {
+                                println!("\n\x1b[33m[Tool execution interrupted by user (Ctrl+C)]\x1b[0m\n");
+                                tool_loop_interrupted = true;
+                                break;
+                            }
+                            out = execute_tool(
+                                fn_name,
+                                args_str,
+                                &catalog,
+                                &mut active_tool_names,
+                            ) => out
+                        };
 
                         eprintln!("\x1b[36m[tool_result] {}\x1b[0m", output);
                         req_builder = req_builder.add_tool_message(&output, &call.id);
                         messages = messages.add_message(TextMessageRole::Tool, &output);
                     }
+
+                    if tool_loop_interrupted {
+                        interrupted = true;
+                        break;
+                    }
+
                     continue;
                 }
             }
@@ -184,8 +275,13 @@ async fn main() -> Result<()> {
             }
             break;
         }
+
+        if interrupted {
+            println!("[interaction cancelled]\n");
+        }
     }
 
+    let _ = rl.save_history(&history_file);
     Ok(())
 }
 
@@ -197,8 +293,8 @@ fn dirs_cache_path() -> PathBuf {
     }
 }
 
-fn is_valid_cache(model_cache_dir: &Path) -> bool {
-    let shard = model_cache_dir.join("q4k-0.uqff");
+fn is_valid_cache(model_cache_dir: &Path, quant_name: &str) -> bool {
+    let shard = model_cache_dir.join(format!("{}-0.uqff", quant_name));
     let report = model_cache_dir.join("uqff_report.json");
     if !shard.is_file() || !report.is_file() {
         return false;
