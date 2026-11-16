@@ -6,23 +6,16 @@ A comprehensive code review of `rust-mlx-cli` was performed on `main.rs`, `Cargo
 
 ## 1. Bug Fixes & Safety Hardening (P0 / Urgent)
 
-- [ ] **Sanitize and Sandbox `run_shell` Tool**:
-  - *Current behavior*: Executes arbitrary shell commands via `sh -c <command>` without restrictions or validation.
-  - *Risk*: Model can run destructive commands (`rm`, overwriting system files, executing malware).
-  - *Fix*: Implement a command whitelist/blacklist, restrict write permissions, or prompt for user confirmation before executing write/mutating shell commands.
-- [ ] **Add Command Timeout to `run_shell`**:
-  - *Current behavior*: `Command::new("sh").arg("-c").output()` blocks synchronously with no timeout.
-  - *Risk*: Commands like `cat`, `sleep 1000`, or interactive utilities freeze the entire CLI process indefinitely.
-  - *Fix*: Execute asynchronously with `tokio::process::Command` wrapped in `tokio::time::timeout(Duration::from_secs(15), ...)`.
-- [ ] **Prevent Out-Of-Memory in `read_file`**:
-  - *Current behavior*: `std::fs::read_to_string(path)` reads the entire file into memory before `.take(4000)`.
-  - *Fix*: Check file metadata first (`entry.metadata()?.len()`); read with `std::io::Read::take(4096)` to protect against multi-gigabyte or binary files.
-- [ ] **Prevent Infinite Tool Loops**:
-  - *Current behavior*: The tool invocation `loop { ... continue; }` has no iteration ceiling.
-  - *Fix*: Add a `max_tool_iterations` counter (e.g., maximum 10-15 steps per user turn) with an error/cutoff message to prevent recursive loops.
-- [ ] **Atomic Cache Completion Verification**:
-  - *Current behavior*: Cache presence only checks `q4k-0.uqff.exists()`. If interrupted during quantization, a corrupted file causes subsequent launches to crash.
-  - *Fix*: Verify both `uqff_report.json` and `q4k-0.uqff` exist and are valid JSON/safetensors, or write to a staging temp directory and rename atomically upon completion.
+- [x] **Sanitize and Sandbox `run_shell` Tool**:
+  - *Implemented*: Added `validate_shell_command` blocking destructive actions (`rm`, `rmdir`, `dd`, `mkfs`, fork bombs, privilege escalation `sudo`/`su`, permissive `chmod`, and piping remote curl/wget scripts to shell).
+- [x] **Add Command Timeout to `run_shell`**:
+  - *Implemented*: Runs asynchronously via `tokio::process::Command` with `kill_on_drop(true)` and a 15-second `tokio::time::timeout`.
+- [x] **Prevent Out-Of-Memory in `read_file`**:
+  - *Implemented*: Checks file metadata (`is_file`), streams with `std::io::Read::take(4096)`, checks for binary data (null bytes), and notes truncation.
+- [x] **Prevent Infinite Tool Loops**:
+  - *Implemented*: Capped tool loop execution at `MAX_TOOL_TURNS` (10 turns per user input) with graceful notification.
+- [x] **Atomic Cache Completion Verification**:
+  - *Implemented*: `is_valid_cache` verifies non-zero byte weight shards (`q4k-0.uqff`) and parsable `uqff_report.json`; cleans up incomplete/corrupted cache folders before re-quantization.
 
 ---
 

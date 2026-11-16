@@ -5,10 +5,9 @@ use mistralrs::{
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
-use std::path::PathBuf;
-use std::process::Command;
-use std::time::Instant;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 struct ToolEntry {
     spec: Tool,
@@ -26,11 +25,10 @@ async fn main() -> Result<()> {
     let cache_dir = dirs_cache_path();
     let safe_name = model_id.replace('/', "--");
     let model_cache_dir = cache_dir.join(format!("{}-q4k", safe_name));
-    let uqff_shard = model_cache_dir.join("q4k-0.uqff");
     let uqff_target = model_cache_dir.join("q4k.uqff");
 
-    let model = if uqff_shard.exists() {
-        // FAST PATH: Load pre-quantized UQFF directly from local cache directory
+    let model = if is_valid_cache(&model_cache_dir) {
+        // FAST PATH: Load pre-quantized UQFF directly from verified local cache directory
         eprintln!(
             "Loading cached Q4K UQFF model from {}...",
             model_cache_dir.display()
@@ -43,7 +41,14 @@ async fn main() -> Result<()> {
         .build()
         .await?
     } else {
-        // FIRST RUN ONLY: Quantize once to Q4K and persist as UQFF for future launches
+        // FIRST RUN OR CORRUPTED CACHE: Clean up partial state and quantize to Q4K
+        if model_cache_dir.exists() {
+            eprintln!(
+                "Incomplete or invalid cache detected in {}. Cleaning up and re-quantizing...",
+                model_cache_dir.display()
+            );
+            let _ = std::fs::remove_dir_all(&model_cache_dir);
+        }
         std::fs::create_dir_all(&model_cache_dir)?;
         eprintln!(
             "First run: quantizing {} to Q4K and saving UQFF cache to {}...",
@@ -108,6 +113,9 @@ async fn main() -> Result<()> {
             .set_sampler_topk(50)
             .set_sampler_frequency_penalty(0.1);
 
+        const MAX_TOOL_TURNS: usize = 10;
+        let mut tool_turn_count = 0;
+
         loop {
             let active_tools: Vec<Tool> = active_tool_names
                 .iter()
@@ -123,6 +131,21 @@ async fn main() -> Result<()> {
 
             if let Some(tool_calls) = &choice.message.tool_calls {
                 if !tool_calls.is_empty() {
+                    tool_turn_count += 1;
+                    if tool_turn_count > MAX_TOOL_TURNS {
+                        eprintln!(
+                            "\x1b[31m[warning] Maximum tool iteration limit ({}) reached. Halting tool loop.\x1b[0m",
+                            MAX_TOOL_TURNS
+                        );
+                        let limit_notice = format!(
+                            "[Execution stopped: exceeded safety limit of {} tool turns]",
+                            MAX_TOOL_TURNS
+                        );
+                        println!("{}\n", limit_notice);
+                        messages = messages.add_message(TextMessageRole::Assistant, &limit_notice);
+                        break;
+                    }
+
                     let assistant_text = choice.message.content.clone().unwrap_or_default();
                     req_builder = req_builder.add_message_with_tool_call(
                         TextMessageRole::Assistant,
@@ -141,7 +164,8 @@ async fn main() -> Result<()> {
                             args_str,
                             &catalog,
                             &mut active_tool_names,
-                        );
+                        )
+                        .await;
 
                         eprintln!("\x1b[36m[tool_result] {}\x1b[0m", output);
                         req_builder = req_builder.add_tool_message(&output, &call.id);
@@ -171,6 +195,60 @@ fn dirs_cache_path() -> PathBuf {
     } else {
         PathBuf::from(".cache")
     }
+}
+
+fn is_valid_cache(model_cache_dir: &Path) -> bool {
+    let shard = model_cache_dir.join("q4k-0.uqff");
+    let report = model_cache_dir.join("uqff_report.json");
+    if !shard.is_file() || !report.is_file() {
+        return false;
+    }
+    let Ok(shard_meta) = std::fs::metadata(&shard) else {
+        return false;
+    };
+    if shard_meta.len() == 0 {
+        return false;
+    }
+    let Ok(report_content) = std::fs::read(&report) else {
+        return false;
+    };
+    serde_json::from_slice::<Value>(&report_content).is_ok()
+}
+
+fn validate_shell_command(cmd: &str) -> std::result::Result<(), String> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return Err("Error: Empty shell command".to_string());
+    }
+
+    let lower = trimmed.to_lowercase();
+    let blocked_patterns = [
+        "rm ", "rm\t", "rmdir", "mkfs", "dd ", "shred", "srm",
+        ":(){ :|:& };:", ">/dev/sd", ">/dev/nvme", ">/dev/disk", ">/dev/rdisk",
+        "> /dev/sd", "> /dev/nvme", "> /dev/disk", "> /dev/rdisk",
+        "sudo ", "sudo\t", "su ", "su\t", "chmod 777", "chmod -r", "chown ",
+        "shutdown", "reboot", "init 0", "halt", "poweroff",
+    ];
+
+    for pattern in blocked_patterns {
+        if lower.contains(pattern) || lower == pattern.trim() {
+            return Err(format!(
+                "Execution blocked for safety: command contains disallowed pattern '{}'. Only safe inspection commands are permitted.",
+                pattern.trim()
+            ));
+        }
+    }
+
+    if (lower.contains("curl") || lower.contains("wget"))
+        && (lower.contains("| sh") || lower.contains("| bash") || lower.contains("| zsh"))
+    {
+        return Err(
+            "Execution blocked for safety: piping downloaded scripts into a shell is disallowed."
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 fn build_tool_catalog() -> HashMap<String, ToolEntry> {
@@ -264,13 +342,16 @@ fn make_tool(name: &str, description: &str, parameters: Value) -> Tool {
     }
 }
 
-fn execute_tool(
+async fn execute_tool(
     name: &str,
     raw_args: &str,
     catalog: &HashMap<String, ToolEntry>,
     active_tool_names: &mut HashSet<String>,
 ) -> String {
-    let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+    let args: Value = match serde_json::from_str(raw_args) {
+        Ok(v) => v,
+        Err(e) => return format!("Error parsing tool arguments as JSON: {}", e),
+    };
 
     match name {
         "search_tools" => {
@@ -289,7 +370,10 @@ fn execute_tool(
                     .unwrap_or("")
                     .to_lowercase();
 
-                if tool_name.to_lowercase().contains(&query) || desc.contains(&query) || query.is_empty() {
+                if tool_name.to_lowercase().contains(&query)
+                    || desc.contains(&query)
+                    || query.is_empty()
+                {
                     active_tool_names.insert(tool_name.clone());
                     matched_schemas.push(json!({
                         "type": "tool_reference",
@@ -301,7 +385,8 @@ fn execute_tool(
             }
 
             if matched_schemas.is_empty() {
-                json!({ "status": "no_matches", "available_hints": ["file", "system", "shell"] }).to_string()
+                json!({ "status": "no_matches", "available_hints": ["file", "system", "shell"] })
+                    .to_string()
             } else {
                 json!({
                     "unlocked_tools": matched_schemas,
@@ -311,29 +396,91 @@ fn execute_tool(
             }
         }
         "read_file" => {
-            let path = args["path"].as_str().unwrap_or("");
-            match std::fs::read_to_string(path) {
-                Ok(content) => content.chars().take(4000).collect(),
-                Err(e) => format!("Error reading '{}': {}", path, e),
+            let path_str = args["path"].as_str().unwrap_or("").trim();
+            if path_str.is_empty() {
+                return "Error: Missing required argument 'path'".to_string();
+            }
+            let path = Path::new(path_str);
+            let metadata = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(e) => return format!("Error accessing '{}': {}", path_str, e),
+            };
+            if !metadata.is_file() {
+                return format!(
+                    "Error: '{}' is a directory or special path, not a regular file.",
+                    path_str
+                );
+            }
+            let file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(e) => return format!("Error opening '{}': {}", path_str, e),
+            };
+
+            let mut buf = Vec::new();
+            if let Err(e) = file.take(4096).read_to_end(&mut buf) {
+                return format!("Error reading '{}': {}", path_str, e);
+            }
+
+            if buf.contains(&0) {
+                return format!("Error: '{}' appears to be a binary file.", path_str);
+            }
+
+            let content = String::from_utf8_lossy(&buf);
+            if metadata.len() > 4096 {
+                format!(
+                    "{}\n... [truncated: showing first 4096 of {} bytes]",
+                    content,
+                    metadata.len()
+                )
+            } else {
+                content.to_string()
             }
         }
         "get_system_info" => {
-            let out = Command::new("uname").arg("-a").output();
-            match out {
-                Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-                Err(e) => format!("Error: {}", e),
+            let timeout_duration = Duration::from_secs(5);
+            let child = tokio::process::Command::new("uname")
+                .arg("-a")
+                .kill_on_drop(true)
+                .output();
+
+            match tokio::time::timeout(timeout_duration, child).await {
+                Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                Ok(Err(e)) => format!("Error: {}", e),
+                Err(_) => "Error: System info probe timed out after 5 seconds.".to_string(),
             }
         }
         "run_shell" => {
-            let cmd = args["command"].as_str().unwrap_or("");
-            let out = Command::new("sh").arg("-c").arg(cmd).output();
-            match out {
-                Ok(o) => {
-                    let stdout = String::from_utf8_lossy(&o.stdout);
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    format!("{}{}", stdout, stderr).chars().take(4000).collect()
+            let cmd = args["command"].as_str().unwrap_or("").trim();
+            if let Err(err) = validate_shell_command(cmd) {
+                return err;
+            }
+
+            let timeout_duration = Duration::from_secs(15);
+            let child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .kill_on_drop(true)
+                .output();
+
+            match tokio::time::timeout(timeout_duration, child).await {
+                Ok(Ok(output)) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let combined = format!("{}{}", stdout, stderr);
+                    if combined.is_empty() {
+                        "[command completed with no output]".to_string()
+                    } else if combined.len() > 4000 {
+                        let truncated: String = combined.chars().take(4000).collect();
+                        format!("{}\n... [output truncated at 4000 characters]", truncated)
+                    } else {
+                        combined
+                    }
                 }
-                Err(e) => format!("Error: {}", e),
+                Ok(Err(e)) => format!("Error executing command: {}", e),
+                Err(_) => format!(
+                    "Error: Command timed out after {} seconds.",
+                    timeout_duration.as_secs()
+                ),
             }
         }
         _ => format!("Unknown tool: {}", name),
