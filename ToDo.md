@@ -32,11 +32,10 @@ A comprehensive code review of `rust-mlx-cli` was performed on `main.rs`, `Cargo
 
 ## 3. Streaming & Output Experience (P1 / High)
 
-- [ ] **Token-by-Token Streaming**:
-  - *Current behavior*: Uses non-streaming `send_chat_request`, causing the terminal to hang until the entire generation completes.
-  - *Fix*: Switch to `stream_chat_request` to stream tokens and reasoning content to stdout in real time.
-- [ ] **Render Markdown & Code Highlighting**:
-  - *Enhancement*: Format markdown tables, lists, and code fences using terminal styling (`termimad` or `syntect`/`crossterm`).
+- [x] **Token-by-Token Streaming**:
+  - *Implemented*: Integrated `model.stream_chat_request` streaming reasoning/thought deltas in dimmed style and response tokens in real-time to stdout.
+- [x] **Render Markdown & Code Highlighting**:
+  - *Implemented*: Added `termimad` with `--markdown` CLI flag and runtime `/markdown` REPL toggle to render formatted markdown, tables, and highlighted code fences.
 
 ---
 

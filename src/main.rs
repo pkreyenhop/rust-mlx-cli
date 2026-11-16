@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use mistralrs::{
-    parse_isq_value, Function, IsqType, RequestBuilder, TextMessageRole, TextMessages,
-    TextModelBuilder, Tool, ToolChoice, ToolType, UqffTextModelBuilder,
+    parse_isq_value, ChatCompletionResponse, Function, IsqType, RequestBuilder, Response,
+    TextMessageRole, TextMessages, TextModelBuilder, Tool, ToolChoice, ToolType,
+    UqffTextModelBuilder,
 };
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,10 @@ struct Args {
     /// Override the default system prompt
     #[arg(long)]
     system_prompt: Option<String>,
+
+    /// Render markdown and code fences with terminal formatting
+    #[arg(long)]
+    markdown: bool,
 }
 
 struct ToolEntry {
@@ -130,6 +135,8 @@ async fn main() -> Result<()> {
         let _ = rl.load_history(&history_file);
     }
 
+    let mut render_markdown = args.markdown;
+
     loop {
         let readline = rl.readline("> ");
         let input = match readline {
@@ -164,6 +171,14 @@ async fn main() -> Result<()> {
             println!("[context and discovered tools cleared]\n");
             continue;
         }
+        if trimmed == "/markdown" {
+            render_markdown = !render_markdown;
+            println!(
+                "[Markdown rendering: {}]\n",
+                if render_markdown { "enabled" } else { "disabled" }
+            );
+            continue;
+        }
 
         messages = messages.add_message(TextMessageRole::User, trimmed);
 
@@ -188,20 +203,87 @@ async fn main() -> Result<()> {
                 .set_tools(active_tools)
                 .set_tool_choice(ToolChoice::Auto);
 
-            // Execute inference with graceful Ctrl+C cancellation
-            let response = tokio::select! {
+            // Execute streaming inference with graceful Ctrl+C cancellation
+            let mut stream = tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     println!("\n\x1b[33m[Generation interrupted by user (Ctrl+C)]\x1b[0m\n");
                     interrupted = true;
                     break;
                 }
-                res = model.send_chat_request(req_builder.clone()) => match res {
-                    Ok(resp) => resp,
+                res = model.stream_chat_request(req_builder.clone()) => match res {
+                    Ok(s) => s,
                     Err(e) => {
                         eprintln!("\x1b[31m[inference error: {}]\x1b[0m\n", e);
                         break;
                     }
                 }
+            };
+
+            let mut started_thinking = false;
+            let mut finished_thinking = false;
+            let mut accumulated_content = String::new();
+            let mut final_response: Option<ChatCompletionResponse> = None;
+            let mut stream_interrupted = false;
+
+            while let Some(chunk_res) = tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\n\x1b[33m[Streaming interrupted by user (Ctrl+C)]\x1b[0m\n");
+                    stream_interrupted = true;
+                    None
+                }
+                chunk = stream.next() => chunk
+            } {
+                match chunk_res {
+                    Response::Chunk(chunk) => {
+                        if let Some(choice) = chunk.choices.first() {
+                            if let Some(reasoning) = &choice.delta.reasoning_content {
+                                if !started_thinking {
+                                    print!("\x1b[2m<think>\n");
+                                    let _ = std::io::stdout().flush();
+                                    started_thinking = true;
+                                }
+                                print!("{}", reasoning);
+                                let _ = std::io::stdout().flush();
+                            }
+                            if let Some(content) = &choice.delta.content {
+                                if started_thinking && !finished_thinking {
+                                    print!("\n</think>\x1b[0m\n\n");
+                                    let _ = std::io::stdout().flush();
+                                    finished_thinking = true;
+                                }
+                                if !render_markdown {
+                                    print!("{}", content);
+                                    let _ = std::io::stdout().flush();
+                                }
+                                accumulated_content.push_str(content);
+                            }
+                        }
+                    }
+                    Response::Done(done_resp) => {
+                        final_response = Some(done_resp);
+                        break;
+                    }
+                    Response::InternalError(e) => {
+                        eprintln!("\x1b[31m[stream error: {}]\x1b[0m", e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            if stream_interrupted {
+                interrupted = true;
+                break;
+            }
+
+            if started_thinking && !finished_thinking {
+                print!("\n</think>\x1b[0m\n\n");
+                let _ = std::io::stdout().flush();
+            }
+
+            let response = match final_response {
+                Some(r) => r,
+                None => break,
             };
 
             let choice = &response.choices[0];
@@ -266,13 +348,14 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if let Some(reasoning) = &choice.message.reasoning_content {
-                println!("\x1b[2m<think>\n{}\n</think>\x1b[0m\n", reasoning.trim());
+            if render_markdown && !accumulated_content.is_empty() {
+                termimad::print_text(&accumulated_content);
+                println!();
+            } else if !render_markdown && !accumulated_content.is_empty() {
+                println!("\n");
             }
-            if let Some(content) = &choice.message.content {
-                println!("{}\n", content.trim());
-                messages = messages.add_message(TextMessageRole::Assistant, content);
-            }
+
+            messages = messages.add_message(TextMessageRole::Assistant, &accumulated_content);
             break;
         }
 
